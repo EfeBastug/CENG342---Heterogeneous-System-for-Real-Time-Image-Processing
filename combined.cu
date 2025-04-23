@@ -488,7 +488,7 @@ int main() {
     cv::VideoCapture capture(0);// Open default camera
     if (!capture.isOpened()) return -1;
 
-    cv::Mat frame, edges, combined, frameGray, otsuBinary, edgesColor;
+    cv::Mat frame, edges, combined, frameGray, otsuBinary, edgesColor, originalFrame;
     capture >> frame;// Capture frame
     const int totalPixels = frame.rows * frame.cols;// Total pixels in the frame
 
@@ -542,10 +542,9 @@ int main() {
 
         switch (filter) {
         case FilterType::KMeans: {
-           
-            if (!frame.isContinuous()) {            
-                frame = frame.clone();         
-            }
+                   
+            originalFrame = frame.clone();         
+            
             // Copy frame's data to device
             cudaMemcpyAsync(device_input, frame.data, totalPixels * sizeof(uchar3), cudaMemcpyHostToDevice, stream);
 
