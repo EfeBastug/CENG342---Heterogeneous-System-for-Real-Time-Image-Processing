@@ -1,4 +1,5 @@
 ﻿#include <opencv2/opencv.hpp>
+#include <opencv2/core/utils/logger.hpp>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <iostream>
@@ -248,13 +249,23 @@ void kmeansCUDA(uchar3* device_input, float3* device_centroids, int* device_labe
 *                        EDGE DETECTION
 *
 *****************************************************************/
-
+/*
+* CUDA Kernel to apply the Sobel edge detection operator.
+* This kernel computes the gradient magnitude at each pixel in the image
+* using Sobel operators Gx and Gy. The result is a grayscale edge image.
+* 
+* Gradient magnitude: G = sqrt(Gx² + Gy²) 
+* Where: Gx is the horizontal edge strength & Gy is the vertical edge strength.
+*/
 __global__ void sobelKernel(uchar3* input, unsigned char* output, int width, int height) {
+    // Calculate global pixel coordinates
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
+    // Ensure thread is within image bounds
     if (x >= width || y >= height) return;
 
+    // Define Sobel kernels for X and Y gradient directions
     int Gx[3][3] = {
         { -1, 0, 1 },
         { -2, 0, 2 },
@@ -269,49 +280,71 @@ __global__ void sobelKernel(uchar3* input, unsigned char* output, int width, int
 
     int sumX = 0, sumY = 0;
 
+    // Apply Sobel filter in a 3x3 neighborhood
     for (int dx = -1; dx <= 1; ++dx) {
         for (int dy = -1; dy <= 1; ++dy) {
+            // Clamp pixel coordinates to image borders
             int nx = min(max(x + dx, 0), width - 1);
             int ny = min(max(y + dy, 0), height - 1);
+
+            // Get pixel color and convert to grayscale using average
             uchar3 pixel = input[ny * width + nx];
             int gray = (pixel.x + pixel.y + pixel.z) / 3;
 
+            // Multiply gray value by kernel weights and accumulate
             sumX += gray * Gx[dy + 1][dx + 1];
             sumY += gray * Gy[dy + 1][dx + 1];
         }
     }
 
+    // Compute gradient magnitude
     int magnitude = sqrtf((float)(sumX * sumX + sumY * sumY));
+
+    // Clamp to maximum grayscale value
     magnitude = min(255, magnitude);
+
+    // Store result in output image
     output[y * width + x] = (unsigned char)magnitude;
 }
 
+/*
+* Host function to apply Sobel edge detection using CUDA.
+* This function allocates device memory, launches the kernel,
+* and handles memory transfer between host and device.
+*/
 void applyEdgeDetectionCUDA(const cv::Mat& input, cv::Mat& output) {
-    int width = input.cols;
-    int height = input.rows;
-    size_t inputSize = width * height * sizeof(uchar3);
-    size_t outputSize = width * height * sizeof(unsigned char);
+    int width = input.cols;  // Input image width
+    int height = input.rows;  // Input image height
+    size_t inputSize = width * height * sizeof(uchar3);  // Input image size
+    size_t outputSize = width * height * sizeof(unsigned char);  // Output image size (grayscale)
 
+    // Device memory pointers
     uchar3* d_input;
     unsigned char* d_output;
 
+    // Allocate memory on GPU
     cudaMalloc(&d_input, inputSize);
     cudaMalloc(&d_output, outputSize);
 
+    // Copy input image data to device
     cudaMemcpy(d_input, input.ptr(), inputSize, cudaMemcpyHostToDevice);
 
+    // Define CUDA block and grid sizes (16x16 = 256 threads per block)
     dim3 block(16, 16);
     dim3 grid((width + 15) / 16, (height + 15) / 16);
 
+    // Launch Sobel kernel
     sobelKernel << <grid, block >> > (d_input, d_output, width, height);
-    cudaDeviceSynchronize();
+    cudaDeviceSynchronize();  // Ensure kernel completes
 
-    output.create(height, width, CV_8UC1);
-    cudaMemcpy(output.ptr(), d_output, outputSize, cudaMemcpyDeviceToHost);
+    // Prepare output image
+    output.create(height, width, CV_8UC1);  // 1-channel output image (grayscale)
+    cudaMemcpy(output.ptr(), d_output, outputSize, cudaMemcpyDeviceToHost);  // Copy result from device to host
 
     // Normalize the result to 0-255 range for better contrast
     cv::normalize(output, output, 0, 255, cv::NORM_MINMAX);
 
+    // Free device memory
     cudaFree(d_input);
     cudaFree(d_output);
 }
