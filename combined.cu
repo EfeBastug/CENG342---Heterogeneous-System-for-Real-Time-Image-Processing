@@ -257,52 +257,138 @@ void kmeansCUDA(uchar3* device_input, float3* device_centroids, int* device_labe
 * Gradient magnitude: G = sqrt(Gx² + Gy²) 
 * Where: Gx is the horizontal edge strength & Gy is the vertical edge strength.
 */
+
+__constant__ int d_Gx[3][3] = {
+    {-1, 0, 1},
+    {-2, 0, 2},
+    {-1, 0, 1}
+};
+
+__constant__ int d_Gy[3][3] = {
+    {-1, -2, -1},
+    { 0,  0,  0},
+    { 1,  2,  1}
+};
+
 __global__ void sobelKernel(uchar3* input, unsigned char* output, int width, int height) {
-    // Calculate global pixel coordinates
+    // Define shared memory for the block's neighborhood
+    // Add 2-pixel border around block for the filter (18x18 shared memory for 16x16 block)
+    __shared__ int s_gray[18][18];  // 16x16 block plus 1-pixel border on each side
+    
+    // Calculate global and local pixel coordinates
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Ensure thread is within image bounds
-    if (x >= width || y >= height) return;
-
-    // Define Sobel kernels for X and Y gradient directions
-    int Gx[3][3] = {
-        { -1, 0, 1 },
-        { -2, 0, 2 },
-        { -1, 0, 1 }
-    };
-
-    int Gy[3][3] = {
-        { -1, -2, -1 },
-        {  0,  0,  0 },
-        {  1,  2,  1 }
-    };
-
-    int sumX = 0, sumY = 0;
-
-    // Apply Sobel filter in a 3x3 neighborhood
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            // Clamp pixel coordinates to image borders
-            int nx = min(max(x + dx, 0), width - 1);
-            int ny = min(max(y + dy, 0), height - 1);
-
-            // Get pixel color and convert to grayscale using average
-            uchar3 pixel = input[ny * width + nx];
-            int gray = (pixel.x + pixel.y + pixel.z) / 3;
-
-            // Multiply gray value by kernel weights and accumulate
-            sumX += gray * Gx[dy + 1][dx + 1];
-            sumY += gray * Gy[dy + 1][dx + 1];
+    int tx = threadIdx.x + 1;  // Local thread coordinates (offset by 1 for the border)
+    int ty = threadIdx.y + 1;
+    
+    // Load the main pixel data for this thread
+    if (x < width && y < height) {
+        uchar3 pixel = input[y * width + x];
+        // Convert to grayscale using average (original formula)
+        s_gray[ty][tx] = (pixel.x + pixel.y + pixel.z) / 3;
+    }
+    
+    // Load the border pixels
+    
+    // Top edge
+    if (threadIdx.y == 0) {
+        // Load the row above the current block
+        int ny = max(y - 1, 0);
+        if (x < width) {
+            uchar3 pixel = input[ny * width + x];
+            s_gray[0][tx] = (pixel.x + pixel.y + pixel.z) / 3;
         }
     }
-
+    
+    // Bottom edge
+    if (threadIdx.y == blockDim.y - 1) {
+        // Load the row below the current block
+        int ny = min(y + 1, height - 1);
+        if (x < width) {
+            uchar3 pixel = input[ny * width + x];
+            s_gray[ty + 1][tx] = (pixel.x + pixel.y + pixel.z) / 3;
+        }
+    }
+    
+    // Left edge
+    if (threadIdx.x == 0) {
+        // Load the column to the left of the current block
+        int nx = max(x - 1, 0);
+        if (y < height) {
+            uchar3 pixel = input[y * width + nx];
+            s_gray[ty][0] = (pixel.x + pixel.y + pixel.z) / 3;
+        }
+    }
+    
+    // Right edge
+    if (threadIdx.x == blockDim.x - 1) {
+        // Load the column to the right of the current block
+        int nx = min(x + 1, width - 1);
+        if (y < height) {
+            uchar3 pixel = input[y * width + nx];
+            s_gray[ty][tx + 1] = (pixel.x + pixel.y + pixel.z) / 3;
+        }
+    }
+    
+    // Load corner pixels (done by 4 threads)
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        // Top-left corner
+        int nx = max(x - 1, 0);
+        int ny = max(y - 1, 0);
+        uchar3 pixel = input[ny * width + nx];
+        s_gray[0][0] = (pixel.x + pixel.y + pixel.z) / 3;
+    }
+    
+    if (threadIdx.x == blockDim.x - 1 && threadIdx.y == 0) {
+        // Top-right corner
+        int nx = min(x + 1, width - 1);
+        int ny = max(y - 1, 0);
+        uchar3 pixel = input[ny * width + nx];
+        s_gray[0][tx + 1] = (pixel.x + pixel.y + pixel.z) / 3;
+    }
+    
+    if (threadIdx.x == 0 && threadIdx.y == blockDim.y - 1) {
+        // Bottom-left corner
+        int nx = max(x - 1, 0);
+        int ny = min(y + 1, height - 1);
+        uchar3 pixel = input[ny * width + nx];
+        s_gray[ty + 1][0] = (pixel.x + pixel.y + pixel.z) / 3;
+    }
+    
+    if (threadIdx.x == blockDim.x - 1 && threadIdx.y == blockDim.y - 1) {
+        // Bottom-right corner
+        int nx = min(x + 1, width - 1);
+        int ny = min(y + 1, height - 1);
+        uchar3 pixel = input[ny * width + nx];
+        s_gray[ty + 1][tx + 1] = (pixel.x + pixel.y + pixel.z) / 3;
+    }
+    
+    // Ensure all threads have loaded their data to shared memory
+    __syncthreads();
+    
+    // Ensure thread is within image bounds before processing
+    if (x >= width || y >= height) return;
+    
+    int sumX = 0, sumY = 0;
+    
+    // Apply Sobel filter using shared memory
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            // Access shared memory with local coordinates
+            int gray = s_gray[ty + dy][tx + dx];
+            
+            // Multiply gray value by kernel weights and accumulate
+            sumX += gray * d_Gx[dy + 1][dx + 1];
+            sumY += gray * d_Gy[dy + 1][dx + 1];
+        }
+    }
+    
     // Compute gradient magnitude
     int magnitude = sqrtf((float)(sumX * sumX + sumY * sumY));
-
+    
     // Clamp to maximum grayscale value
     magnitude = min(255, magnitude);
-
+    
     // Store result in output image
     output[y * width + x] = (unsigned char)magnitude;
 }
@@ -317,33 +403,73 @@ void applyEdgeDetectionCUDA(const cv::Mat& input, cv::Mat& output) {
     int height = input.rows;  // Input image height
     size_t inputSize = width * height * sizeof(uchar3);  // Input image size
     size_t outputSize = width * height * sizeof(unsigned char);  // Output image size (grayscale)
-
+    
     // Device memory pointers
     uchar3* d_input;
     unsigned char* d_output;
-
-    // Allocate memory on GPU
-    cudaMalloc(&d_input, inputSize);
-    cudaMalloc(&d_output, outputSize);
-
+    
+    // Allocate memory on GPU with error checking
+    cudaError_t err = cudaMalloc(&d_input, inputSize);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Error allocating device memory for input: %s\n", cudaGetErrorString(err));
+        return;
+    }
+    
+    err = cudaMalloc(&d_output, outputSize);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Error allocating device memory for output: %s\n", cudaGetErrorString(err));
+        cudaFree(d_input);
+        return;
+    }
+    
     // Copy input image data to device
-    cudaMemcpy(d_input, input.ptr(), inputSize, cudaMemcpyHostToDevice);
-
+    err = cudaMemcpy(d_input, input.ptr(), inputSize, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Error copying data to device: %s\n", cudaGetErrorString(err));
+        cudaFree(d_input);
+        cudaFree(d_output);
+        return;
+    }
+    
     // Define CUDA block and grid sizes (16x16 = 256 threads per block)
     dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
-
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    
     // Launch Sobel kernel
-    sobelKernel << <grid, block >> > (d_input, d_output, width, height);
-    cudaDeviceSynchronize();  // Ensure kernel completes
-
+    sobelKernel<<<grid, block>>>(d_input, d_output, width, height);
+    
+    // Check for kernel launch errors
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Kernel launch error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_input);
+        cudaFree(d_output);
+        return;
+    }
+    
+    err = cudaDeviceSynchronize();  // Ensure kernel completes
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Kernel execution error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_input);
+        cudaFree(d_output);
+        return;
+    }
+    
     // Prepare output image
     output.create(height, width, CV_8UC1);  // 1-channel output image (grayscale)
-    cudaMemcpy(output.ptr(), d_output, outputSize, cudaMemcpyDeviceToHost);  // Copy result from device to host
-
+    
+    // Copy result from device to host
+    err = cudaMemcpy(output.ptr(), d_output, outputSize, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Error copying data from device: %s\n", cudaGetErrorString(err));
+        cudaFree(d_input);
+        cudaFree(d_output);
+        return;
+    }
+    
     // Normalize the result to 0-255 range for better contrast
     cv::normalize(output, output, 0, 255, cv::NORM_MINMAX);
-
+    
     // Free device memory
     cudaFree(d_input);
     cudaFree(d_output);
